@@ -68,17 +68,14 @@ class Strip:
     def show(self) -> None:
         """
         Write the current pixel colors to the LED strip.
+        Note: Brightness is NOT applied here - it should be pre-applied in the color values
+        to avoid double-scaling when used with led-control's render functions.
         """
         if self._has_white:
             # RGBW: 4 bytes per pixel (G, R, B, W order for SK6812)
             buffer = np.array(
                 [
-                    np.array([
-                        pixel.g * self._brightness,
-                        pixel.r * self._brightness,
-                        pixel.b * self._brightness,
-                        pixel.w * self._brightness
-                    ])
+                    np.array([pixel.g, pixel.r, pixel.b, pixel.w])
                     for pixel in self._pixels
                 ],
                 dtype=np.uint8,
@@ -87,11 +84,7 @@ class Strip:
             # RGB: 3 bytes per pixel (G, R, B order for WS2812)
             buffer = np.array(
                 [
-                    np.array([
-                        pixel.g * self._brightness,
-                        pixel.r * self._brightness,
-                        pixel.b * self._brightness
-                    ])
+                    np.array([pixel.g, pixel.r, pixel.b])
                     for pixel in self._pixels
                 ],
                 dtype=np.uint8,
