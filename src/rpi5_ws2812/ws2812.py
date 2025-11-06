@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-import time
 
 import numpy as np
 from spidev import SpiDev
@@ -207,9 +206,6 @@ class WS2812SpiDriver(WS2812StripDriver):
         
         # Initialize clear buffer
         self._clear_buffer = bytearray(WS2812SpiDriver.PREAMBLE + spi_bytes)
-        
-        # Track last write time for reset delay
-        self._last_write_time = 0
 
     def _encode_byte_to_spi(self, byte_val: int) -> bytes:
         """
@@ -238,16 +234,15 @@ class WS2812SpiDriver(WS2812StripDriver):
 
     def write(self, buffer: np.ndarray) -> None:
         """
-        Write colors to the LED strip
+        Write colors to the LED strip.
+        
+        Note: SK6812/WS2812 require >50µs reset time between frames, but this is
+        automatically satisfied by normal animation frame rates (typically 30-60 FPS).
+        No artificial delay needed.
+        
         :param buffer: A 2D numpy array of shape (num_leds, 3) for RGB or (num_leds, 4) for RGBW
                        where the last dimension is the GRB or GRBW values
         """
-        # SK6812/WS2812 require >80µs reset time between frames
-        # Ensure minimum delay to prevent flickering
-        elapsed = time.monotonic() - self._last_write_time
-        if elapsed < 0.0001:  # 100µs minimum delay
-            time.sleep(0.0001 - elapsed)
-        
         # Build SPI buffer: preamble + encoded color data
         spi_data = bytearray(WS2812SpiDriver.PREAMBLE)
         
@@ -257,7 +252,6 @@ class WS2812SpiDriver(WS2812StripDriver):
             spi_data.extend(self._encode_byte_to_spi(byte_val))
         
         self._device.writebytes2(spi_data)
-        self._last_write_time = time.monotonic()
 
     def clear(self) -> None:
         """Reset all LEDs to off"""
