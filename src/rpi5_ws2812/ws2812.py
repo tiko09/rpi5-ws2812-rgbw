@@ -64,6 +64,59 @@ class Strip:
         :param color: The color to set the pixel to
         """
         self._pixels[i] = color
+    
+    def set_pixels_batch(self, start: int, colors: list) -> None:
+        """
+        Set multiple pixels at once (batch operation for performance).
+        :param start: Starting index
+        :param colors: List of Color objects or tuples (r, g, b, w) or (r, g, b)
+        """
+        for i, color in enumerate(colors):
+            idx = start + i
+            if idx >= self._led_count:
+                break
+            if isinstance(color, Color):
+                self._pixels[idx] = color
+            elif isinstance(color, (tuple, list)):
+                # Support both (r,g,b) and (r,g,b,w) tuples
+                if len(color) >= 4:
+                    self._pixels[idx] = Color(color[0], color[1], color[2], color[3])
+                else:
+                    self._pixels[idx] = Color(color[0], color[1], color[2], 0)
+            else:
+                raise ValueError(f"Invalid color type: {type(color)}")
+    
+    def set_pixels_array(self, start: int, rgbw_array: np.ndarray) -> None:
+        """
+        Set multiple pixels from a NumPy array (fastest batch operation).
+        :param start: Starting index
+        :param rgbw_array: NumPy array of shape (n, 3) for RGB or (n, 4) for RGBW, dtype uint8
+        """
+        n_pixels = len(rgbw_array)
+        end = min(start + n_pixels, self._led_count)
+        n_actual = end - start
+        
+        if rgbw_array.shape[1] == 4:
+            # RGBW array
+            for i in range(n_actual):
+                self._pixels[start + i] = Color(
+                    int(rgbw_array[i, 0]),
+                    int(rgbw_array[i, 1]),
+                    int(rgbw_array[i, 2]),
+                    int(rgbw_array[i, 3])
+                )
+        elif rgbw_array.shape[1] == 3:
+            # RGB array
+            for i in range(n_actual):
+                self._pixels[start + i] = Color(
+                    int(rgbw_array[i, 0]),
+                    int(rgbw_array[i, 1]),
+                    int(rgbw_array[i, 2]),
+                    0
+                )
+        else:
+            raise ValueError(f"Invalid array shape: {rgbw_array.shape}. Expected (n, 3) or (n, 4)")
+
 
     def show(self) -> None:
         """
