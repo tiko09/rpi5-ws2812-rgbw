@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import time
 
 import numpy as np
 from spidev import SpiDev
@@ -209,6 +210,9 @@ class WS2812SpiDriver(WS2812StripDriver):
             WS2812SpiDriver.PREAMBLE + led_count * self._bits_per_pixel, 
             dtype=np.uint8
         )
+        
+        # Track last write time for reset delay
+        self._last_write_time = 0
 
     def write(self, buffer: np.ndarray) -> None:
         """
@@ -216,12 +220,19 @@ class WS2812SpiDriver(WS2812StripDriver):
         :param buffer: A 2D numpy array of shape (num_leds, 3) for RGB or (num_leds, 4) for RGBW
                        where the last dimension is the GRB or GRBW values
         """
+        # SK6812/WS2812 require >80µs reset time between frames
+        # Ensure minimum delay to prevent flickering
+        elapsed = time.monotonic() - self._last_write_time
+        if elapsed < 0.0001:  # 100µs minimum delay
+            time.sleep(0.0001 - elapsed)
+        
         flattened_colors = buffer.ravel()
         color_bits = np.unpackbits(flattened_colors)
         self._buffer[WS2812SpiDriver.PREAMBLE:] = np.where(
             color_bits == 1, WS2812SpiDriver.LED_ONE, WS2812SpiDriver.LED_ZERO
         )
         self._device.writebytes2(self._buffer)
+        self._last_write_time = time.monotonic()
 
     def clear(self) -> None:
         """
