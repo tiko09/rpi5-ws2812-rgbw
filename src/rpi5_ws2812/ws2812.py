@@ -56,6 +56,12 @@ class Strip:
         self._has_white = has_white
         self._pixels: list[Color] = [Color(0, 0, 0, 0)] * self._led_count
         self._backend = backend
+        
+        # Pre-allocate NumPy buffer for fast pixel-to-array conversion
+        if has_white:
+            self._pixel_buffer = np.zeros((self._led_count, 4), dtype=np.uint8)
+        else:
+            self._pixel_buffer = np.zeros((self._led_count, 3), dtype=np.uint8)
 
     def set_pixel_color(self, i: int, color: Color) -> None:
         """
@@ -123,26 +129,26 @@ class Strip:
         Write the current pixel colors to the LED strip.
         Note: Brightness is NOT applied here - it should be pre-applied in the color values
         to avoid double-scaling when used with led-control's render functions.
+        
+        OPTIMIZED: Uses pre-allocated buffer and vectorized operations.
         """
-        if self._has_white:
-            # RGBW: 4 bytes per pixel (G, R, B, W order for SK6812)
-            buffer = np.array(
-                [
-                    np.array([pixel.g, pixel.r, pixel.b, pixel.w])
-                    for pixel in self._pixels
-                ],
-                dtype=np.uint8,
-            )
-        else:
-            # RGB: 3 bytes per pixel (G, R, B order for WS2812)
-            buffer = np.array(
-                [
-                    np.array([pixel.g, pixel.r, pixel.b])
-                    for pixel in self._pixels
-                ],
-                dtype=np.uint8,
-            )
-        self._backend.write(buffer)
+        # Fast path: Copy pixel data to pre-allocated buffer
+        # This is MUCH faster than list comprehension
+        for i in range(self._led_count):
+            pixel = self._pixels[i]
+            if self._has_white:
+                # GRBW order for SK6812
+                self._pixel_buffer[i, 0] = pixel.g
+                self._pixel_buffer[i, 1] = pixel.r
+                self._pixel_buffer[i, 2] = pixel.b
+                self._pixel_buffer[i, 3] = pixel.w
+            else:
+                # GRB order for WS2812
+                self._pixel_buffer[i, 0] = pixel.g
+                self._pixel_buffer[i, 1] = pixel.r
+                self._pixel_buffer[i, 2] = pixel.b
+        
+        self._backend.write(self._pixel_buffer)
 
     def clear(self) -> None:
         """
@@ -229,6 +235,33 @@ class WS2812SpiDriver(WS2812StripDriver):
     LED_ZERO: int = 0b100  # 0.42us high, 0.83us low
     LED_ONE: int = 0b110   # 0.83us high, 0.42us low
     PREAMBLE: int = 42
+    
+    # Pre-compute lookup table for SPI encoding (256 entries)
+    # This avoids bit manipulation in the hot path
+    _SPI_LOOKUP = None
+
+    @classmethod
+    def _init_spi_lookup(cls):
+        """Initialize SPI encoding lookup table (called once)."""
+        if cls._SPI_LOOKUP is not None:
+            return
+        
+        cls._SPI_LOOKUP = []
+        for byte_val in range(256):
+            # Encode each bit position
+            bits = []
+            for i in range(7, -1, -1):  # MSB first
+                bit = (byte_val >> i) & 1
+                bits.append('110' if bit else '100')
+            
+            # Convert 24-bit string to 3 bytes
+            bit_string = ''.join(bits)
+            packed = bytes([
+                int(bit_string[0:8], 2),
+                int(bit_string[8:16], 2),
+                int(bit_string[16:24], 2)
+            ])
+            cls._SPI_LOOKUP.append(packed)
 
     def __init__(self, spi_bus: int, spi_device: int, led_count: int, has_white: bool = False):
         """
@@ -239,6 +272,9 @@ class WS2812SpiDriver(WS2812StripDriver):
         :param has_white: True for SK6812-RGBW (4 bytes per pixel), False for WS2812 (3 bytes per pixel)
         """
         super().__init__(has_white)
+        
+        # Initialize lookup table once
+        WS2812SpiDriver._init_spi_lookup()
         
         self._device = SpiDev()
         self._device.open(spi_bus, spi_device)
@@ -259,35 +295,15 @@ class WS2812SpiDriver(WS2812StripDriver):
         
         # Initialize clear buffer
         self._clear_buffer = bytearray(WS2812SpiDriver.PREAMBLE + spi_bytes)
-
-    def _encode_byte_to_spi(self, byte_val: int) -> bytes:
-        """
-        Encode one data byte (8 bits) to SPI format.
-        Each data bit becomes 3 SPI bits:
-        - 1 -> 110 (high for ~0.8us, low for ~0.4us at 2.4MHz)
-        - 0 -> 100 (high for ~0.4us, low for ~0.8us at 2.4MHz)
         
-        Returns 3 bytes (24 SPI bits for 8 data bits)
-        """
-        # Build bit string: each data bit -> 3 SPI bits
-        bit_string = ''
-        for i in range(7, -1, -1):  # MSB first
-            bit = (byte_val >> i) & 1
-            if bit:
-                bit_string += '110'  # LED_ONE
-            else:
-                bit_string += '100'  # LED_ZERO
-        
-        # Convert 24-bit string to 3 bytes
-        packed = bytearray(3)
-        for i in range(3):
-            packed[i] = int(bit_string[i*8:(i+1)*8], 2)
-        
-        return bytes(packed)
+        # Pre-allocate SPI buffer for performance
+        self._spi_buffer = bytearray(WS2812SpiDriver.PREAMBLE + spi_bytes)
 
     def write(self, buffer: np.ndarray) -> None:
         """
         Write colors to the LED strip.
+        
+        OPTIMIZED: Uses pre-computed lookup table and pre-allocated buffer.
         
         Note: SK6812/WS2812 require >50µs reset time between frames, but this is
         automatically satisfied by normal animation frame rates (typically 30-60 FPS).
@@ -296,15 +312,17 @@ class WS2812SpiDriver(WS2812StripDriver):
         :param buffer: A 2D numpy array of shape (num_leds, 3) for RGB or (num_leds, 4) for RGBW
                        where the last dimension is the GRB or GRBW values
         """
-        # Build SPI buffer: preamble + encoded color data
-        spi_data = bytearray(WS2812SpiDriver.PREAMBLE)
-        
-        # Encode each byte of color data
+        # Use pre-allocated buffer and lookup table for maximum speed
+        offset = WS2812SpiDriver.PREAMBLE
         flattened_colors = buffer.ravel()
-        for byte_val in flattened_colors:
-            spi_data.extend(self._encode_byte_to_spi(byte_val))
         
-        self._device.writebytes2(spi_data)
+        # Fast lookup-based encoding (no bit manipulation in hot path)
+        for byte_val in flattened_colors:
+            encoded = WS2812SpiDriver._SPI_LOOKUP[byte_val]
+            self._spi_buffer[offset:offset+3] = encoded
+            offset += 3
+        
+        self._device.writebytes2(self._spi_buffer)
 
     def clear(self) -> None:
         """Reset all LEDs to off"""
