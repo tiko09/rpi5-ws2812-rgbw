@@ -165,11 +165,17 @@ class WS2812SpiDriver(WS2812StripDriver):
     """
     Driver for WS2812/WS2812B (RGB) and SK6812-RGBW LED strips using the SPI interface on the Raspberry Pi.
     Supports both 3-byte (RGB) and 4-byte (RGBW) pixel formats.
+    
+    Uses 3-bit SPI encoding per data bit at 2.4MHz SPI clock:
+    - Data bit 1: SPI pattern 110 (~0.8us high, ~0.4us low)
+    - Data bit 0: SPI pattern 100 (~0.4us high, ~0.8us low)
+    This matches WS2812/SK6812 timing requirements.
     """
 
-    # WS2812 timings. Thanks to https://github.com/mattaw/ws2812_spi_python
-    LED_ZERO: int = 0b1100_0000
-    LED_ONE: int = 0b1111_1100
+    # Bit patterns for SPI encoding (3 SPI bits per data bit)
+    # At 2.4MHz SPI: each SPI bit is ~0.42us
+    LED_ZERO: int = 0b100  # 0.42us high, 0.83us low
+    LED_ONE: int = 0b110   # 0.83us high, 0.42us low
     PREAMBLE: int = 42
 
     def __init__(self, spi_bus: int, spi_device: int, led_count: int, has_white: bool = False):
@@ -185,34 +191,50 @@ class WS2812SpiDriver(WS2812StripDriver):
         self._device = SpiDev()
         self._device.open(spi_bus, spi_device)
 
-        self._device.max_speed_hz = 6_500_000
+        # 2.4MHz for 3-bit encoding (each bit ~0.42us)
+        self._device.max_speed_hz = 2_400_000
         self._device.mode = 0b00
         self._device.lsbfirst = False
 
         self._led_count = led_count
         
-        # Calculate bits per pixel: RGB = 3 bytes * 8 bits = 24, RGBW = 4 bytes * 8 bits = 32
-        self._bits_per_pixel = 32 if has_white else 24
+        # Bytes per pixel: RGB = 3 bytes, RGBW = 4 bytes
+        self._bytes_per_pixel = 4 if has_white else 3
         
-        # Initialize clear buffer with correct size
-        self._clear_buffer = np.zeros(
-            WS2812SpiDriver.PREAMBLE + led_count * self._bits_per_pixel, 
-            dtype=np.uint8
-        )
-        self._clear_buffer[WS2812SpiDriver.PREAMBLE:] = np.full(
-            led_count * self._bits_per_pixel, 
-            WS2812SpiDriver.LED_ZERO, 
-            dtype=np.uint8
-        )
-
-        # Initialize main buffer
-        self._buffer = np.zeros(
-            WS2812SpiDriver.PREAMBLE + led_count * self._bits_per_pixel, 
-            dtype=np.uint8
-        )
+        # Each data byte becomes 3 bytes in SPI (8 bits * 3 SPI bits per bit = 24 SPI bits = 3 bytes)
+        # Total SPI bytes = led_count * bytes_per_pixel * 3
+        spi_bytes = led_count * self._bytes_per_pixel * 3
+        
+        # Initialize clear buffer
+        self._clear_buffer = bytearray(WS2812SpiDriver.PREAMBLE + spi_bytes)
         
         # Track last write time for reset delay
         self._last_write_time = 0
+
+    def _encode_byte_to_spi(self, byte_val: int) -> bytes:
+        """
+        Encode one data byte (8 bits) to SPI format.
+        Each data bit becomes 3 SPI bits:
+        - 1 -> 110 (high for ~0.8us, low for ~0.4us at 2.4MHz)
+        - 0 -> 100 (high for ~0.4us, low for ~0.8us at 2.4MHz)
+        
+        Returns 3 bytes (24 SPI bits for 8 data bits)
+        """
+        # Build bit string: each data bit -> 3 SPI bits
+        bit_string = ''
+        for i in range(7, -1, -1):  # MSB first
+            bit = (byte_val >> i) & 1
+            if bit:
+                bit_string += '110'  # LED_ONE
+            else:
+                bit_string += '100'  # LED_ZERO
+        
+        # Convert 24-bit string to 3 bytes
+        packed = bytearray(3)
+        for i in range(3):
+            packed[i] = int(bit_string[i*8:(i+1)*8], 2)
+        
+        return bytes(packed)
 
     def write(self, buffer: np.ndarray) -> None:
         """
@@ -226,17 +248,19 @@ class WS2812SpiDriver(WS2812StripDriver):
         if elapsed < 0.0001:  # 100µs minimum delay
             time.sleep(0.0001 - elapsed)
         
+        # Build SPI buffer: preamble + encoded color data
+        spi_data = bytearray(WS2812SpiDriver.PREAMBLE)
+        
+        # Encode each byte of color data
         flattened_colors = buffer.ravel()
-        color_bits = np.unpackbits(flattened_colors)
-        self._buffer[WS2812SpiDriver.PREAMBLE:] = np.where(
-            color_bits == 1, WS2812SpiDriver.LED_ONE, WS2812SpiDriver.LED_ZERO
-        )
-        self._device.writebytes2(self._buffer)
+        for byte_val in flattened_colors:
+            spi_data.extend(self._encode_byte_to_spi(byte_val))
+        
+        self._device.writebytes2(spi_data)
         self._last_write_time = time.monotonic()
 
     def clear(self) -> None:
-        """
-        Reset all LEDs to off"""
+        """Reset all LEDs to off"""
         self._device.writebytes2(self._clear_buffer)
 
     def get_led_count(self) -> int:
